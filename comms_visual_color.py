@@ -9,21 +9,65 @@ import torch.optim as optim
 from tqdm import tqdm
 from collections import defaultdict
 import os, pickle
+import numpy as np
+import matplotlib.pyplot as plt
+
 
 # ---------------------
 # Hyperparameters
 # ---------------------
-MAX_SEQ_LEN = 10  # Maximum length of communication sequence
-OBS_SIZE = 26    # Number of possible observations
-VOCAB_SIZE = 3    # Size of "language" for the speaker
-MAX_TURNS = 10     # Max # of turns (also limits seq lenght)
+
+OBS_DIM = 3    # Side length of observation grid
+OBS_SIZE = 3 # 0 + 2 colors
+VOCAB_SIZE = 6    # Size of "language" for the speaker
+MAX_TURNS = 4     # Max # of turns (also limits seq lenght)
+MAX_SEQ_LEN = OBS_DIM * OBS_DIM + MAX_TURNS  # Max sequence length for speaker
 EPISODES = 50000
-MINI_EPISODES = 4
-LR = 1e-4
-GAMMA = 0.99
+MINI_EPISODES = 10
+LR = 3e-5
+GAMMA = 0.95
 LAMBDA = 0.95
-EPS_CLIP = 0.1
-ENTROPY_COEF = 0.05
+EPS_CLIP = 0.15
+ENTROPY_COEF = 0.07
+
+Tshape = np.array([
+    [0, 1, 0],
+    [0, 1, 0],
+    [1, 1, 1]
+])
+
+square = np.array([
+    [1, 1, 1],
+    [1, 0, 1],
+    [1, 1, 1]
+])
+
+cross_diagonal = np.array([
+    [1, 0, 1],
+    [0, 1, 0],
+    [1, 0, 1]
+])
+
+cross = np.array([
+    [0, 1, 0],
+    [1, 1, 1],
+    [0, 1, 0]
+])
+
+line_vertical = np.array([
+    [0, 1, 0],
+    [0, 1, 0],
+    [0, 1, 0]
+])
+
+line_horizontal = np.array([
+    [0, 0, 0],
+    [1, 1, 1],
+    [0, 0, 0]
+])
+
+shapes = [Tshape, square, cross_diagonal, cross, line_vertical, line_horizontal]
+
 
 # Things to try:
 # multiple episodes before ppo update
@@ -129,7 +173,7 @@ class SpeakerNet(nn.Module):
 
 class ListenerNet(nn.Module):
     """Takes the sequence of comm tokens, outputs a guess about the target obs."""
-    def __init__(self, vocab_size, obs_size, d_model=64, num_heads=4, ff_hidden=128, dropout=0.1):
+    def __init__(self, vocab_size, num_shapes, num_colors, d_model=64, num_heads=4, ff_hidden=128, dropout=0.1):
         super(ListenerNet, self).__init__()
         self.d_model = d_model
         self.transformer = TransformerEncoder(
@@ -139,7 +183,7 @@ class ListenerNet(nn.Module):
             nn.Linear(d_model, 128),
             nn.ReLU(),
         )
-        self.actor = nn.Linear(128, obs_size)
+        self.actor = nn.Linear(128, num_shapes + num_colors)
         self.critic = nn.Linear(128, 1)
 
     def forward(self, x, pad_mask=None):
@@ -150,18 +194,23 @@ class ListenerNet(nn.Module):
         out = self.transformer(x, src_key_padding_mask=pad_mask)
         pooled = out[:, -1, :]
         hidden = self.fc(pooled)
-        logits = self.actor(hidden)
+        logits_combined = self.actor(hidden)
         value = self.critic(hidden)
-        return logits, value
+        logits_shape, logits_color = torch.split(logits_combined, [6, 2], dim=-1)
+        return logits_shape, logits_color, value
+    
+    def embed(self, x):
+        out = self.transformer.embedding(x)
+        return out
 
 # ---------------------
 # Single Model that holds Speaker & Listener
 # ---------------------
 class SpeakerListenerModel(nn.Module):
-    def __init__(self, obs_size, vocab_size):
+    def __init__(self, obs_size, vocab_size, shapes_size, colors_size):
         super(SpeakerListenerModel, self).__init__()
-        self.speaker_net = SpeakerNet(obs_size, vocab_size)
-        self.listener_net = ListenerNet(vocab_size, obs_size)
+        self.speaker_net = SpeakerNet(obs_size, vocab_size) # note that obs_size is 2 because we have binary obs
+        self.listener_net = ListenerNet(vocab_size, shapes_size, colors_size)
 
     def forward_speaker(self, x, pad_mask=None):
         return self.speaker_net(x, pad_mask)
@@ -173,30 +222,22 @@ class SpeakerListenerModel(nn.Module):
 # Single PPO that updates both Speaker & Listener
 # ---------------------
 class SpeakerListenerPPO:
-    def __init__(self, obs_size, vocab_size, gamma=GAMMA, eps_clip=EPS_CLIP, lr=LR,
+    def __init__(self, obs_size, vocab_size, shapes_size, colors_size, gamma=GAMMA, eps_clip=EPS_CLIP, lr=LR,
                  lmbda=LAMBDA, entropy_coef=ENTROPY_COEF):
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.lmbda = lmbda
         self.entropy_coef = entropy_coef
 
-        self.policy = SpeakerListenerModel(obs_size, vocab_size)
-        self.old_policy = SpeakerListenerModel(obs_size, vocab_size)
+        self.policy = SpeakerListenerModel(obs_size, vocab_size, shapes_size, colors_size)
+        self.old_policy = SpeakerListenerModel(obs_size, vocab_size, shapes_size, colors_size)
         self.old_policy.load_state_dict(self.policy.state_dict())
 
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr, weight_decay=1e-4)
 
-    def select_action(self, obs_tokens, comm_tokens):
-        """
-        obs_tokens: [batch_size, seq_len_obs], but we have 1 environment => shape (1, seq_len_obs)
-        comm_tokens: [batch_size, seq_len_comm]
-        
-        We'll produce:
-          speaker_action: next token from speaker
-          listener_action: guessed obs from listener
-        """
+    def select_action(self, obs_shape, comm_tokens):
         # 1) Speaker forward
-        speaker_logits, speaker_value = self.old_policy.forward_speaker(obs_tokens)
+        speaker_logits, speaker_value = self.old_policy.forward_speaker(obs_shape)
         speaker_probs = torch.softmax(speaker_logits, dim=-1)
         speaker_dist = torch.distributions.Categorical(speaker_probs)
         speaker_action = speaker_dist.sample()
@@ -208,14 +249,28 @@ class SpeakerListenerPPO:
         )
 
         # 3) Listener forward
-        listener_logits, listener_value = self.old_policy.forward_listener(updated_comm_tokens)
-        listener_probs = torch.softmax(listener_logits, dim=-1)
-        listener_dist = torch.distributions.Categorical(listener_probs)
-        listener_action = listener_dist.sample()
-        listener_logprob = listener_dist.log_prob(listener_action)
+        listener_logits_shape, listener_logits_color, listener_value = self.old_policy.forward_listener(updated_comm_tokens)
+
+        # Sample actions for both shape and color
+        listener_probs_shape = torch.softmax(listener_logits_shape, dim=-1)
+        listener_probs_color = torch.softmax(listener_logits_color, dim=-1)
+
+        listener_dist_shape = torch.distributions.Categorical(listener_probs_shape)
+        listener_dist_color = torch.distributions.Categorical(listener_probs_color)
+
+        listener_action_shape = listener_dist_shape.sample()
+        listener_action_color = listener_dist_color.sample()
+
+        # Compute log probabilities
+        listener_logprob_shape = listener_dist_shape.log_prob(listener_action_shape)
+        listener_logprob_color = listener_dist_color.log_prob(listener_action_color)
+
+        # Sum log probabilities (for combined optimization later)
+        listener_logprob = listener_logprob_shape + listener_logprob_color
 
         return (speaker_action, speaker_logprob, speaker_value,
-                listener_action, listener_logprob, listener_value)
+                (listener_action_shape, listener_action_color),
+                (listener_logprob_shape, listener_logprob_color), listener_value)
 
     def compute_gae(self, rewards, masks, values, next_value):
         """
@@ -270,11 +325,15 @@ class SpeakerListenerPPO:
         rewards = np.array(rewards)
         masks = np.array(masks)
 
-        
-        if rewards.std() > 1e-8:
-            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-        else:
-            rewards = rewards - rewards.mean()
+        listener_logprobs_shape = listener_logprobs[:, 0]
+        listener_logprobs_color = listener_logprobs[:, 1]
+        listener_action_shape = listener_actions[:, 0]
+        listener_action_color = listener_actions[:, 1]
+
+        # if rewards.std() > 1e-8:
+        #     rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        # else:
+        #     rewards = rewards - rewards.mean()
 
         # Next value estimates (last step)
         next_value_speaker = 0.0
@@ -286,13 +345,6 @@ class SpeakerListenerPPO:
 
         # For multiple minibatch updates
         for _ in range(4):
-            # Re-run forward pass with current policy
-            # Each time step is separate, so we'll process them in a batch.
-            # First, pad obs_tokens & comm_tokens to a uniform shape: [T, <=MAX_SEQ_LEN].
-            # For simplicity below, let's do them step by step in a loop or just assume T=1. 
-            # In a real training scenario, you'd properly batch/pad them. 
-            # Here, we'll just process each step as its own "mini-batch".
-            
             # We'll accumulate losses across all steps, then do one optimizer step.
             total_loss = 0.0
             total_actor_loss = 0.0
@@ -308,15 +360,6 @@ class SpeakerListenerPPO:
                 obs_t = torch.LongTensor(obs_t).unsqueeze(0)   # [1, obs_seq_len]
                 comm_t = torch.LongTensor(comm_t).unsqueeze(0) # [1, comm_seq_len]
 
-                # (Optionally) create pad masks if your sequences are shorter than MAX_SEQ_LEN
-                # For example, if your comm_t is length L < MAX_SEQ_LEN:
-                #   pad_length = MAX_SEQ_LEN - L
-                #   padded_comm = F.pad(comm_t, (0,pad_length), value=0)
-                #   pad_mask = torch.zeros_like(padded_comm).bool()
-                #   pad_mask[:, L:] = True
-                # In practice, you'd keep track of which tokens are real vs pad.
-                # For brevity, we won't show that detail for every step here.
-
                 # speaker forward
                 speaker_logits, speaker_val = self.policy.forward_speaker(obs_t, pad_mask=None)
                 speaker_probs = torch.softmax(speaker_logits, dim=-1)
@@ -328,15 +371,24 @@ class SpeakerListenerPPO:
                 # We append the *actual* speaker_actions[t] to comm_t
                 # to replicate the same input the old policy had:
                 updated_comm = torch.cat([comm_t, speaker_actions[t].view(1,1)], dim=1)
-                listener_logits, listener_val = self.policy.forward_listener(updated_comm, pad_mask=None)
-                listener_probs = torch.softmax(listener_logits, dim=-1)
-                listener_dist = torch.distributions.Categorical(listener_probs)
-                new_listener_logprob = listener_dist.log_prob(listener_actions[t].unsqueeze(0))
-                listener_entropy = listener_dist.entropy().mean()
+                listener_logits_shape, listener_logits_color, listener_val = self.policy.forward_listener(updated_comm, pad_mask=None)
+                # Sample actions for both shape and color
+                listener_probs_shape = torch.softmax(listener_logits_shape, dim=-1)
+                listener_probs_color = torch.softmax(listener_logits_color, dim=-1)
+
+                listener_dist_shape = torch.distributions.Categorical(listener_probs_shape)
+                listener_dist_color = torch.distributions.Categorical(listener_probs_color)
+                # Compute log probabilities
+                new_listener_logprob_shape = listener_dist_shape.log_prob(listener_action_shape[t].unsqueeze(0))
+                new_listener_logprob_color = listener_dist_color.log_prob(listener_action_color[t].unsqueeze(0))
+
+                # Sum log probabilities (for combined optimization later)
+                listener_entropy = (listener_dist_shape.entropy().mean() + listener_dist_color.entropy().mean()) / 2
 
                 # Compute ratio
                 ratio_speaker = torch.exp(new_speaker_logprob - speaker_logprobs[t])
-                ratio_listener = torch.exp(new_listener_logprob - listener_logprobs[t])
+                ratio_listener_shape = torch.exp(new_listener_logprob_shape - listener_logprobs_shape[t])
+                ratio_listener_color = torch.exp(new_listener_logprob_color - listener_logprobs_color[t])
 
                 adv_speaker = advantages_speaker[t]
                 adv_listener = advantages_listener[t]
@@ -346,10 +398,13 @@ class SpeakerListenerPPO:
                 surr2_speaker = torch.clamp(ratio_speaker, 1 - self.eps_clip, 1 + self.eps_clip) * adv_speaker
                 actor_loss_speaker = -torch.min(surr1_speaker, surr2_speaker)
 
-                surr1_listener = ratio_listener * adv_listener
-                surr2_listener = torch.clamp(ratio_listener, 1 - self.eps_clip, 1 + self.eps_clip) * adv_listener
-                actor_loss_listener = -torch.min(surr1_listener, surr2_listener)
-
+                surr1_listener_shape = ratio_listener_shape * adv_listener
+                surr2_listener_shape = torch.clamp(ratio_listener_shape, 1 - self.eps_clip, 1 + self.eps_clip) * adv_listener
+                actor_loss_listener_shape = -torch.min(surr1_listener_shape, surr2_listener_shape)
+                surr1_listener_color = ratio_listener_color * adv_listener
+                surr2_listener_color = torch.clamp(ratio_listener_color, 1 - self.eps_clip, 1 + self.eps_clip) * adv_listener
+                actor_loss_listener_color = -torch.min(surr1_listener_color, surr2_listener_color)
+                actor_loss_listener = actor_loss_listener_shape + actor_loss_listener_color
                 # Critic losses
                 ret_speaker = returns_speaker[t]
                 ret_listener = returns_listener[t]
@@ -368,7 +423,6 @@ class SpeakerListenerPPO:
                 listener_val_loss_clipped = (value_pred_listener_clipped - ret_listener) ** 2
                 listener_val_loss_normal = (listener_val - ret_listener) ** 2
                 critic_loss_listener = 0.5 * torch.max(listener_val_loss_clipped, listener_val_loss_normal)
-
                 # Sum up losses
                 total_actor_loss += (actor_loss_speaker + actor_loss_listener)
                 total_critic_loss += (critic_loss_speaker + critic_loss_listener)
@@ -401,59 +455,62 @@ class SpeakerListenerPPO:
 # ---------------------
 # Simple Communication Environment
 # ---------------------
-class CommEnv:
-    def __init__(self, obs_size, ts_limit=10):
+class VisualCommEnv:
+    def __init__(self, obs_dim, ts_limit=10):
         self.ts_limit = ts_limit
-        self.obs_size = obs_size
-        # self.comms = []
+        self.obs_dim = obs_dim
         self.current_obs = None
+        self.current_shape = None
+        self.current_color = None
         self.reset()
 
-    def reset(self, obj=None):
-        if obj is None:
-            obj = random.randint(0, self.obs_size - 1)
-        self.current_obs = torch.tensor([obj], dtype=torch.long)  # shape [1]
+    def reset(self, current_shape=None, current_color=None):
+        if current_shape is None:
+            current_shape_i = random.randint(0, len(shapes)-1)
+        else:
+            current_shape_i = current_shape
+
+        if current_color is None:
+            self.current_color = random.randint(0, 1)
+        else:
+            self.current_color = current_color
+
+        self.current_shape = current_shape_i
+        self.current_obs = shapes[current_shape_i]
+        self.current_obs = torch.tensor(self.current_obs).view(-1) * (self.current_color + 1)
         self.comms = []
         self.timesteps = 0
         return self.current_obs
 
-    def step(self, speaker_action, listener_action):
+    def step(self, speaker_action, listener_action_shape, listener_action_color):
         self.timesteps += 1
         done = self.timesteps >= self.ts_limit
         if done:
             return self.current_obs, -2, True, {}
         
         # self.comms.append(speaker_action)
-
         # Reward: +1 if listener action matches the actual observation
-        if listener_action == self.current_obs.item():
-            reward = 1.0
+        if listener_action_shape == self.current_shape and listener_action_color == self.current_color:
+            reward = (self.ts_limit + 1) / 2
             done = True
+        elif listener_action_shape == self.current_shape:
+            reward = 1
+        elif listener_action_color == self.current_color:
+            reward = 0
         else:
             reward = -(self.timesteps / self.ts_limit)
-
-        # penalize spamming one letter
-        # if any one letter is > 75% of comms and comms is more than 1, then penalize
-        # if len(self.comms) > 1:
-        #     counts = defaultdict(int)
-        #     for c in self.comms:
-        #         counts[c] += 1
-        #     if max(counts.values()) > 0.75 * len(self.comms):
-        #         reward -= 0.5
 
         return self.current_obs, reward, done, {}
 
 # ---------------------
 # Training
 # ---------------------
-def train(env, agent, n_episodes=EPISODES, n_mini_episodes=MINI_EPISODES):
-    pbar = tqdm(range(n_episodes))
+def train(env, agent, n_episodes=EPISODES, n_mini_episodes=MINI_EPISODES, start_point=0):
+    pbar = tqdm(range(n_episodes), initial=start_point)
     reward_history = []
     loss_history = []
 
     speaker_probs_history = []
-
-    # env.ts_limit = 1
 
     for ep in pbar:
         
@@ -470,7 +527,8 @@ def train(env, agent, n_episodes=EPISODES, n_mini_episodes=MINI_EPISODES):
             'rewards': [],
             'masks': []
         }
-
+        total_ep_reward = 0
+        total_correct = 0
         for _ in range(n_mini_episodes):
             obs = env.reset()
             done = False
@@ -481,26 +539,19 @@ def train(env, agent, n_episodes=EPISODES, n_mini_episodes=MINI_EPISODES):
             # if we want a single embedding space:
             # e.g. speaker sees obs as token in [vocab_size..vocab_size+obs_size-1].
             obs_tokens = obs + VOCAB_SIZE  # shift by +2 if vocab_size=2. shape [1]
-            obs_tokens = obs_tokens.unsqueeze(0)  # [1, 1]
+            obs_tokens = obs_tokens.view(1, -1)  # [3, 3] -> [1, 9]
             # concatenate obs and comms
             obs_tokens = torch.concat((obs_tokens, comm_tokens), dim=-1)
-
-            ep_reward = 0
 
             while not done:
                 # Let agent choose speaker_action, listener_action
                 (spk_a, spk_lp, spk_val,
                 lis_a, lis_lp, lis_val) = agent.select_action(obs_tokens, comm_tokens)
-                
-                with torch.no_grad():
-                    speaker_logits, _ = agent.old_policy.forward_speaker(obs_tokens)
-                    spk_probs = torch.softmax(speaker_logits, dim=-1)  # shape [1, vocab_size]
-                    speaker_probs_history.append(spk_probs.squeeze(0).cpu().numpy())
 
                 # Step in the environment
-                next_obs, reward, done, _ = env.step(spk_a.item(), lis_a.item())
+                next_obs, reward, done, _ = env.step(spk_a.item(), lis_a[0].item(), lis_a[1].item())
 
-                ep_reward += reward
+                total_ep_reward += reward
 
                 # Store
                 memory['obs_tokens'].append(obs_tokens.squeeze(0).tolist())       # shape [1, obs_seq_len]
@@ -508,8 +559,8 @@ def train(env, agent, n_episodes=EPISODES, n_mini_episodes=MINI_EPISODES):
                 memory['speaker_actions'].append(spk_a.item())
                 memory['speaker_logprobs'].append(spk_lp.item())
                 memory['speaker_values'].append(spk_val.item())
-                memory['listener_actions'].append(lis_a.item())
-                memory['listener_logprobs'].append(lis_lp.item())
+                memory['listener_actions'].append(lis_a)
+                memory['listener_logprobs'].append(lis_lp)
                 memory['listener_values'].append(lis_val.item())
                 memory['rewards'].append(reward)
                 memory['masks'].append(0 if done else 1)
@@ -519,20 +570,27 @@ def train(env, agent, n_episodes=EPISODES, n_mini_episodes=MINI_EPISODES):
 
                 # next obs
                 obs = next_obs
-                obs_tokens = (obs + VOCAB_SIZE).unsqueeze(0)  # shape [1,1]
+                obs_tokens = obs + VOCAB_SIZE  # shift by +2 if vocab_size=2. shape [1]
+                obs_tokens = obs_tokens.view(1, -1)  # [3, 3] -> [1, 9]
+                # concatenate obs and comms
                 obs_tokens = torch.concat((obs_tokens, comm_tokens), dim=-1)
+            # check if the last action was correct
+            if env.current_shape == lis_a[0].item() and env.current_color == lis_a[1].item():
+                total_correct += 1
 
+        total_ep_reward /= n_mini_episodes
+        total_correct /= n_mini_episodes
         # Train using the entire episode
         loss = agent.train(memory)
         loss_history.append(loss)
-        reward_history.append(ep_reward)
+        reward_history.append(total_ep_reward)
 
         # balance ts limit increase in such a way that the last 10% of training is with max ts size
         # env.ts_limit = min(MAX_TURNS, int(MAX_TURNS * (ep / n_episodes) + 1))
 
-        pbar.set_description(f"Ep {ep} Reward: {ep_reward:.2f}, Loss: {loss}, TSLIMIT: {env.ts_limit}")
+        pbar.set_description(f"Ep {ep} Reward: {total_ep_reward:.2f}, Loss: {loss}, Acc: {total_correct:.2f}")
         if ep % 1000 == 0:
-            agent.save_to(f"checkpoint{ep}.pth")
+            agent.save_to(f"checkpoint{ep + start_point}.pth")
             with open("losses.pkl", "wb") as f:
                 pickle.dump(loss_history, f)
             with open("rewards.pkl", "wb") as f:
@@ -545,92 +603,222 @@ def train(env, agent, n_episodes=EPISODES, n_mini_episodes=MINI_EPISODES):
 # Testing
 # ---------------------
 def test(env, agent, n_episodes=10):
-    comm_map = "abcdefghijklmnopqrstuvwxyz"  # to visualize tokens 0->a,1->b,...
-    obs_map = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"    # to visualize obs 0->A,1->B,...
+    num_correct = 0
     for ep in range(n_episodes):
         obs = env.reset()
         done = False
-        comm_tokens = torch.zeros((1,0), dtype=torch.long)
-        obs_tokens = (obs + VOCAB_SIZE).unsqueeze(0)  # shape [1,1]
-        obs_tokens = torch.concat((obs_tokens, comm_tokens), dim=-1)
+        comm_tokens = torch.zeros((1, 0), dtype=torch.long)
+        obs_tokens = obs + VOCAB_SIZE
+        obs_tokens = obs_tokens.view(1, -1)
+        obs_tokens = torch.cat((obs_tokens, comm_tokens), dim=-1)
+        ep_reward = 0
 
-        comm_string = ""
         while not done:
-            # We'll do a deterministic action by argmax
-            with torch.no_grad():
-                spk_logits, _ = agent.policy.forward_speaker(obs_tokens)
-                spk_probs = torch.softmax(spk_logits, dim=-1)
-                
-                spk_a = spk_probs.argmax(dim=-1)  # [1]
-            comm_string += comm_map[spk_a.item()]
+            (spk_a, spk_lp, spk_val,
+            lis_a, lis_lp, lis_val) = agent.select_action(obs_tokens, comm_tokens)
+
+            next_obs, reward, done, _ = env.step(spk_a.item(), lis_a[0].item(), lis_a[1].item())        
+            ep_reward += reward
             comm_tokens = torch.cat([comm_tokens, spk_a.view(1,1)], dim=1)
-
-            with torch.no_grad():
-                lis_logits, _ = agent.policy.forward_listener(comm_tokens)
-                lis_probs = torch.softmax(lis_logits, dim=-1)
-                lis_a = lis_probs.argmax(dim=-1)
-
-            next_obs, reward, done, _ = env.step(spk_a.item(), lis_a.item())
-
             obs = next_obs
-            obs_tokens = (obs + VOCAB_SIZE).unsqueeze(0)  # shape [1,1]
-            obs_tokens = torch.concat((obs_tokens, comm_tokens), dim=-1)
-            
-            print(f"Ep: {ep}, Comm: {comm_string}, Target: {obs_map[next_obs.item()]}, Pred: {obs_map[lis_a.item()]}")
+            obs_tokens = obs + VOCAB_SIZE
+            obs_tokens = obs_tokens.view(1, -1)
+            obs_tokens = torch.cat((obs_tokens, comm_tokens), dim=-1)
 
-def get_translations(env, agent, n_episodes=10):
-    comm_map = "abcdefghijklmnopqrstuvwxyz"  # to visualize tokens 0->a,1->b,...
-    obs_map = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"    # to visualize obs 0->A,1->B,...
+        if env.current_shape == lis_a[0].item() and env.current_color == lis_a[1].item():
+            num_correct += 1
+
+    # print(f"Accuracy: {num_correct}/{n_episodes}")
+    return num_correct / n_episodes
+    
+
+def get_translations(env, agent, n_episodes=10, only_color=False, only_shape=False):
+    comm_map = "abcdefghijklmnopqrstuvwxyz"
+    shapes_map = ["Tshape", "square", "cross_diagonal", "cross", "line_vertical", "line_horizontal"]
+    num_correct = 0
     translations = {}
-
     for ep in range(n_episodes):
-        for obsi in range(OBS_SIZE):
-            obs = env.reset(obsi)
-            
-            done = False
-            comm_tokens = torch.zeros((1,0), dtype=torch.long)
-            obs_tokens = (obs + VOCAB_SIZE).unsqueeze(0)  # shape [1,1]
-            obs_tokens = torch.concat((obs_tokens, comm_tokens), dim=-1)
+        for color in range(2):
+            for shape in range(len(shapes)):
+                obs = env.reset(current_shape=shape, current_color=color)
+                done = False
+                comm_tokens = torch.zeros((1, 0), dtype=torch.long)
+                obs_tokens = obs + VOCAB_SIZE
+                obs_tokens = obs_tokens.view(1, -1)
+                
+                obs_tokens = torch.cat((obs_tokens, comm_tokens), dim=-1)
+                comm_str = ""
+                ep_reward = 0   
 
-            comm_string = ""
-            while not done:
-                # We'll do a deterministic action by argmax
-                with torch.no_grad():
-                    spk_logits, _ = agent.policy.forward_speaker(obs_tokens)
-                    spk_probs = torch.softmax(spk_logits, dim=-1)
-                    
-                    spk_a = spk_probs.argmax(dim=-1)  # [1]
-                comm_string += comm_map[spk_a.item()]
-                comm_tokens = torch.cat([comm_tokens, spk_a.view(1,1)], dim=1)
-
-                with torch.no_grad():
-                    lis_logits, _ = agent.policy.forward_listener(comm_tokens)
-                    lis_probs = torch.softmax(lis_logits, dim=-1)
-                    lis_a = lis_probs.argmax(dim=-1)
-
-                next_obs, reward, done, _ = env.step(spk_a.item(), lis_a.item())
-
-                obs = next_obs
-                obs_tokens = (obs + VOCAB_SIZE).unsqueeze(0)  # shape [1,1]
-                obs_tokens = torch.concat((obs_tokens, comm_tokens), dim=-1)
-
-            if obs_map[next_obs.item()] not in translations:
-                translations[obs_map[next_obs.item()]] = []
-            if reward > 0:
-                translations[obs_map[next_obs.item()]].append(comm_string)
+                while not done:
+                    (spk_a, spk_lp, spk_val,
+                    lis_a, lis_lp, lis_val) = agent.select_action(obs_tokens, comm_tokens)
+                    next_obs, reward, done, _ = env.step(spk_a.item(), lis_a[0].item(), lis_a[1].item())        
+                    ep_reward += reward
+                    comm_str += comm_map[spk_a.item()]
+                    comm_tokens = torch.cat([comm_tokens, spk_a.view(1,1)], dim=1)
+                    obs = next_obs
+                    obs_tokens = obs + VOCAB_SIZE
+                    obs_tokens = obs_tokens.view(1, -1)
+                    obs_tokens = torch.cat((obs_tokens, comm_tokens), dim=-1)
+                if only_color:
+                    key = ("red" if color == 0 else "blue")
+                elif only_shape:
+                    key = shapes_map[shape]
+                else:
+                    key = (shapes_map[shape], "red" if color == 0 else "blue")
+                if key not in translations:
+                    translations[key] = set()
+                if env.current_color == lis_a[1].item() and only_color:
+                    translations[key].add(comm_str)
+                    num_correct += 1
+                elif env.current_shape == lis_a[0].item() and only_shape:
+                    translations[key].add(comm_str)
+                    num_correct += 1
+                elif env.current_shape == lis_a[0].item() and env.current_color == lis_a[1].item():
+                    translations[key].add(comm_str)
+                    num_correct += 1
+    print(f"Accuracy: {num_correct}/{n_episodes*len(shapes)*2}")
     return translations
+
+def TNSEProjection(agent):
+    # project vocab to 2D using TSNE for only the listener embeddings
+
+    # get all the embeddings
+    embeddings_listener = []
+    embeddings_speaker = []
+    for i in range(VOCAB_SIZE):
+        comm_tokens = torch.tensor([i]).view(1, 1)
+        embedding_listener = agent.policy.listener_net.embed(comm_tokens)
+        embeddings_listener.append(embedding_listener.squeeze(0).detach().numpy())
+
+    for i in range(VOCAB_SIZE + OBS_SIZE):
+        comm_tokens = torch.tensor([i]).view(1, 1)
+        embedding_speaker = agent.policy.speaker_net.transformer.embedding(comm_tokens)
+        embeddings_speaker.append(embedding_speaker.squeeze(0).detach().numpy())
+
+    embeddings_listener = np.array(embeddings_listener).squeeze(1)
+    embeddings_speaker = np.array(embeddings_speaker).squeeze(1)
+    # project to 2D
+    from sklearn.manifold import TSNE
+    tsne = TSNE(n_components=2, random_state=0, perplexity=1)
+    embeddings_2d_listener = tsne.fit_transform(embeddings_listener)
+    embeddings_2d_speaker = tsne.fit_transform(embeddings_speaker)
+
+    # I want to display figures side by side and label them
+
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+    vocab_map = "abcdefghijklmnopqrstuvwxyz"[:VOCAB_SIZE]
+    for i, txt in enumerate(range(VOCAB_SIZE)):
+        axs[0].annotate(vocab_map[i], (embeddings_2d_listener[i, 0], embeddings_2d_listener[i, 1]))
+    for i, txt in enumerate(range(VOCAB_SIZE + OBS_SIZE)):
+        if i < VOCAB_SIZE:
+            axs[1].annotate(vocab_map[i], (embeddings_2d_speaker[i, 0], embeddings_2d_speaker[i, 1]))
+        else:
+            axs[1].annotate(["None", "Red", "Blue"][i - VOCAB_SIZE], (embeddings_2d_speaker[i, 0], embeddings_2d_speaker[i, 1]))
+    axs[0].scatter(embeddings_2d_listener[:, 0], embeddings_2d_listener[:, 1])
+    axs[0].set_title("Listener Embeddings")
+    axs[1].scatter(embeddings_2d_speaker[:, 0], embeddings_2d_speaker[:, 1])
+    axs[1].set_title("Speaker Embeddings")
+    plt.show()
+
+    embeddings_shapes_blue = []
+    embeddings_shapes_red = []
+    for i in range(len(shapes)):
+        comm_tokens = torch.tensor(shapes[i]).view(1, -1) + VOCAB_SIZE
+        embedding = agent.policy.speaker_net.transformer.embedding(comm_tokens).mean(dim=1)
+        embeddings_shapes_red.append(embedding.squeeze(0).detach().numpy())
+        comm_tokens = torch.tensor(shapes[i]).view(1, -1) * 2 + VOCAB_SIZE
+        embedding = agent.policy.speaker_net.transformer.embedding(comm_tokens).mean(dim=1)
+        embeddings_shapes_blue.append(embedding.squeeze(0).detach().numpy())
+    embeddings_shapes_red = np.array(embeddings_shapes_red)
+    embeddings_shapes_blue = np.array(embeddings_shapes_blue)
+    
+    all_embeddings = np.concatenate([embeddings_shapes_red, embeddings_shapes_blue])
+    # project to 2D
+    embeddings_2d_shapes = tsne.fit_transform(all_embeddings)
+
+    fig = plt.figure(figsize=(6, 5))
+
+    shapes_map = ["Tshape", "square", "cross_diagonal", "cross", "line_vertical", "line_horizontal"]
+
+    for i, txt in enumerate(range(len(shapes))):
+        plt.annotate(shapes_map[i] + " red", (embeddings_2d_shapes[i, 0], embeddings_2d_shapes[i, 1]))
+    for i, txt in enumerate(range(len(shapes))):
+        plt.annotate(shapes_map[i] + " blue", (embeddings_2d_shapes[i + len(shapes), 0], embeddings_2d_shapes[i + len(shapes), 1]))
+    plt.scatter(embeddings_2d_shapes[:, 0], embeddings_2d_shapes[:, 1])
+    plt.title("Shape Embeddings")
+    plt.show()
+
+
+    # plot
+    # plt.figure(figsize=(6, 5))
+    # plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1])
+    # vocab_map = "abcdefghijklmnopqrstuvwxyz"
+    # for i, txt in enumerate(range(VOCAB_SIZE)):
+    #     plt.annotate(vocab_map[i], (embeddings_2d[i, 0], embeddings_2d[i, 1]))
+    # plt.show()
+
+    # return embeddings_2d
+
+def display_all_shapes():
+    shapes_map = ["Tshape", "square", "cross_diagonal", "cross", "line_vertical", "line_horizontal"]
+
+    # display as figs, in binary, and label them
+    # dont show axis
+    fig, axs = plt.subplots(1, 6, figsize=(12, 8))
+    for i in range(len(shapes)):
+        ax = axs[i]
+        # invert the colors
+        ax.imshow(shapes[i].reshape(3, 3), cmap="gray_r")
+        ax.axis("off")
+        ax.set_title(shapes_map[i])
+    plt.show()
+
+def create_accuracy_graph(env, folder_path):
+    import matplotlib.pyplot as plt
+    import pickle
+    import os
+
+    acc = []
+    episodes = []
+    for file in tqdm(os.listdir(folder_path)):
+        if file.endswith(".pth") and "listener" not in file and "Best" not in file:
+            agent = SpeakerListenerPPO(obs_size=OBS_SIZE, vocab_size=VOCAB_SIZE, colors_size=OBS_SIZE-1, shapes_size=len(shapes))
+            agent.load_from(os.path.join(folder_path, file))
+            acci = test(env, agent, n_episodes=30)
+            acc.append(acci)
+            episodes.append(int(file.split(".")[0][10:]))
+    acc_sorted = sorted(zip(episodes, acc), key=lambda x: x[0])
+    episodes, acc = zip(*acc_sorted)
+    plt.plot(episodes, acc)
+    plt.title("Accuracy")
+    plt.xlabel("Episodes")
+    plt.ylabel("Accuracy")
+    plt.show()
+
 
 # ---------------------
 # Main
 # ---------------------
 if __name__ == "__main__":
-    env = CommEnv(OBS_SIZE, ts_limit=MAX_TURNS)
-    agent = SpeakerListenerPPO(obs_size=OBS_SIZE, vocab_size=VOCAB_SIZE)
+    display_all_shapes()
+    env = VisualCommEnv(OBS_DIM, ts_limit=MAX_TURNS)
+
+    # create_accuracy_graph(env, "./saves/visual2")
+
+    agent = SpeakerListenerPPO(obs_size=OBS_SIZE, vocab_size=VOCAB_SIZE, colors_size=OBS_SIZE-1, shapes_size=len(shapes))
+
+    agent.load_from("./saves/visual2/checkpoint27000.pth")
+    # for i in range(EPISODES, -1000, -1000):
+    #     if os.path.exists(f"checkpoint{i}.pth"):
+    #         agent.load_from(f"checkpoint{i}.pth")
+    #         print(f"Loaded from checkpoint{i}.pth")
+    #         break
 
     # if not os.path.exists("speaker_listener.pth"):
-    #     rewards, losses, dists = train(env, agent, n_episodes=EPISODES)
+    #     rewards, losses, dists = train(env, agent, n_episodes=EPISODES, start_point=i)
     #     agent.save_to("speaker_listener.pth")
-
 
     #     # Plot if desired
     #     import matplotlib.pyplot as plt
@@ -655,10 +843,18 @@ if __name__ == "__main__":
     #     plt.legend()
     #     plt.show()
 
-    # # else:
-    agent.load_from("checkpoint4000.pth")
+
 
     # Test
-    #test(env, agent, n_episodes=5)
-    ts = get_translations(env, agent, n_episodes=10)
-    print(ts)
+    test(env, agent, n_episodes=100)
+    print("Translations")
+    print("Color")
+    translations = get_translations(env, agent, n_episodes=3, only_color=True, only_shape=False)
+    print(translations)
+    print("Shape")
+    translations = get_translations(env, agent, n_episodes=5, only_color=False, only_shape=True)
+    print(translations)
+    print("Both")
+    translations = get_translations(env, agent, n_episodes=5, only_color=False, only_shape=False)
+    print(translations)
+    TNSEProjection(agent)
