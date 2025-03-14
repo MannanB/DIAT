@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
@@ -96,7 +97,7 @@ class SpeakerNet(nn.Module):
 
 class ListenerNet(nn.Module):
     """Takes the sequence of comm tokens, outputs a guess about the target obs."""
-    def __init__(self, vocab_size, obs_size, d_model=64, num_heads=4, ff_hidden=128, dropout=0.1):
+    def __init__(self, vocab_size, action_size, d_model=64, num_heads=4, ff_hidden=128, dropout=0.1):
         super(ListenerNet, self).__init__()
         self.d_model = d_model
         self.transformer = TransformerEncoder(
@@ -106,7 +107,7 @@ class ListenerNet(nn.Module):
             nn.Linear(d_model, 128),
             nn.ReLU(),
         )
-        self.actor = nn.Linear(128, obs_size)
+        self.actor = nn.Linear(128, action_size)
         self.critic = nn.Linear(128, 1)
 
     def forward(self, x, pad_mask=None):
@@ -125,10 +126,23 @@ class ListenerNet(nn.Module):
 # Single Model that holds Speaker & Listener
 # ---------------------
 class SpeakerListenerModel(nn.Module):
-    def __init__(self, obs_size, vocab_size):
+    def __init__(self, obs_size, vocab_size, action_size):
         super(SpeakerListenerModel, self).__init__()
         self.speaker_net = SpeakerNet(obs_size, vocab_size)
-        self.listener_net = ListenerNet(vocab_size, obs_size)
+        self.listener_net = ListenerNet(vocab_size, action_size)
+
+    def forward_speaker(self, x, pad_mask=None):
+        return self.speaker_net(x, pad_mask)
+
+    def forward_listener(self, x, pad_mask=None):
+        return self.listener_net(x, pad_mask)
+    
+
+class SpeakerListenerModel2(nn.Module):
+    def __init__(self, obs_size, vocab_size, action_size, listener_obs_size):
+        super(SpeakerListenerModel2, self).__init__()
+        self.speaker_net = SpeakerNet(obs_size, vocab_size)
+        self.listener_net = ListenerNet(vocab_size + listener_obs_size, action_size)
 
     def forward_speaker(self, x, pad_mask=None):
         return self.speaker_net(x, pad_mask)
